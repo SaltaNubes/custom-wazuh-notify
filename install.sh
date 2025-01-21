@@ -53,7 +53,9 @@ function customWazuhNotify() {
         * ) echo -e "\n${redColour}Invalid response${endColour}" ;;
         esac
     else
-        cp ./custom-wazuh-notify $integrations_path
+        cp ./custom-wazuh-notify* $integrations_path
+        chmod --reference=/var/ossec/integrations/slack /var/ossec/integrations/custom-wazuh*
+        chown --reference=/var/ossec/integrations/slack /var/ossec/integrations/custom-wazuh*
     fi
 
     # Verifying config.yaml file
