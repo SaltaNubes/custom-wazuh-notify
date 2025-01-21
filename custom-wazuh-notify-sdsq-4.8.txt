@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import smtplib
+import yaml
+import logging
+from mako.template import Template
+from mako.lookup import TemplateLookup
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from utils.utils import get
+
+
+def render_string_template(template_string, data):
+    template = Template(template_string)
+    return template.render(data=data)
+
+def render_template(template_name, data):
+    lookup = TemplateLookup(directories=['./integrations/'])
+    template = lookup.get_template(template_name)
+    return template.render(data=data)
+
+def configure_logger(log_level, log_output, log_file_path):
+    logger = logging.getLogger(__name__)
+    logger.setLevel(getattr(logging, log_level.upper()))
+
+    formatter = logging.Formatter('%(asctime)s %(filename)s: %(levelname)s: %(name)s: %(message)s', "%Y/%m/%d %H:%M:%S")
+
+    if log_output.lower() == 'file':
+        file_handler = logging.FileHandler(log_file_path)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    elif log_output.lower() == 'stdout':
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    else:
+        raise ValueError("Invalid log output mode. Use 'file' or 'stdout'")
+
+    return logger
+
+def load_config(config_path):
+    with open(config_path, 'r') as yaml_file:
+        return yaml.safe_load(yaml_file)
+
+def send_email(smtp_server, smtp_port, smtp_username, smtp_password, from_email, destination_emails, msg):
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.sendmail(from_email, destination_emails, msg.as_string())
+            server.quit()
+        logger.info("Email sent successfully!")
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+
+def alert_email(config, event, from_email, destination_emails, subject_email, template_name):
+    body = render_template(template_name, event)
+    logger.info(f"Rendered email body: {body}")
+    destination_email_list = destination_emails.split(",")
+
+    #subject_email = event['rule']['description']
+    #agent_name = event['agent']['name']
+    #rule_id = event['rule']['id']
+
+    smtp_server = get(config, 'smtp_server')
+    smtp_port = get(config, 'smtp_port')
+    smtp_username = get(config, 'smtp_username')
+    smtp_password = get(config, 'smtp_password')
+
+    if from_email is None:
+        from_email = config['default_from']
+
+    msg = MIMEMultipart()
+    msg['From'] = from_email
+    msg['To'] = ",".join(destination_email_list)
+    msg['Subject'] = subject_email
+    #msg['Subject'] = subject_email  + " | " + "AgentName: " + agent_name + " | " + "RuleID: " + rule_id
+    msg.attach(MIMEText(body, 'plain'))
+
+    send_email(smtp_server, smtp_port, smtp_username, smtp_password, from_email, destination_email_list, msg)
+
+
+def process_alert(config, wazuh_event_file_path, wazuh_integration_params):
+    alert_type = get(wazuh_integration_params, 'alert_type')
+    if not alert_type:
+        logger.error(f"Missing 'alert_type' in params: {wazuh_integration_params}")
+        sys.exit(1)
+
+    with open(wazuh_event_file_path, "r") as json_file:
+        wazuh_event = json.load(json_file)
+
+    if alert_type == 'email':
+        from_email = get(wazuh_integration_params, 'alert_config.email_from', None)
+        subject_email = get(wazuh_integration_params, 'alert_config.email_subject', None)
+        if not subject_email:
+            logger.error(f"Alert type {alert_type}, missing 'email_subject' in params: {wazuh_integration_params}")
+            sys.exit(1)
+        subject_template = f"<%from utils.utils import get%>{subject_email}"
+        subject_email = render_string_template(subject_template, wazuh_event)
+        logger.info(f"Rendered email subject: {subject_email}")
+
+        template_name = get(wazuh_integration_params, 'alert_config.email_template', None)
+        if not template_name:
+            logger.error(f"Alert type {alert_type}, missing 'email_template' in params: {wazuh_integration_params}")
+            sys.exit(1)
+
+        destination_emails = get(wazuh_integration_params, 'alert_config.destination_emails', None)
+        if not destination_emails:
+            logger.error(f"Alert type {alert_type}, missing 'destination_emails' in params: {wazuh_integration_params}")
+            sys.exit(1)
+
+        profile_name = get(wazuh_integration_params, 'alert_config.profile', None)
+        if not profile_name:
+            logger.error(f"Alert type {alert_type}, missing 'profile' in params: {wazuh_integration_params}")
+            sys.exit(1)
+
+        profile_config = config['profiles']['email'][profile_name]
+        alert_email(profile_config, wazuh_event, from_email, destination_emails, subject_email, template_name)
+
+
+def main():
+    if len(sys.argv) < 3:
+        logger.error("Missing required parameters")
+        sys.exit(1)
+
+    wazuh_event_file_path = sys.argv[1]
+    wazuh_arguments = ' '.join(sys.argv[2:])
+    if '10 3 > ' in wazuh_arguments:
+        wazuh_arguments = wazuh_arguments.split('10 3 > /dev/null')[0].strip()
+    else:
+        wazuh_arguments = wazuh_arguments.split('> /dev/null')[0].strip()
+    #wazuh_arguments = wazuh_arguments.split('> /dev/null')[0].strip()
+    wazuh_integration_params = json.loads(wazuh_arguments)
+
+    process_alert(config, wazuh_event_file_path, wazuh_integration_params)
+
+
+if __name__ == "__main__":
+    config = load_config('./integrations/config.yaml')
+    logger = configure_logger(config['global_config']['log_level'],
+                              config['global_config']['log_output'],
+                              config['global_config']['log_path'])
+    main()

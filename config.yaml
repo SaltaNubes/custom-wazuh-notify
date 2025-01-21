@@ -1,0 +1,18 @@
+profiles:
+  email:
+    email_profile1:
+      smtp_username: "<username-or-service-mail>"
+      smtp_password: "<password>"
+      smtp_server: "smtp.server.com"
+      smtp_port: 587
+      default_from: "<username-or-service-mail>@gmail.com"
+    email_profile2:
+      smtp_username: "<username-or-service-mail>"
+      smtp_password: "<password>"
+      smtp_server: "smtp.server.com"
+      smtp_port: 587
+      default_from: "<username-or-service-mail>@gmail.com"
+global_config:
+  log_level: "info"
+  log_path: "/var/ossec/logs/ossec.log"
+  log_output: "file" # file or stdout
