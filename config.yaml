@@ -16,3 +16,8 @@ global_config:
   log_level: "info"
   log_path: "/var/ossec/logs/ossec.log"
   log_output: "file" # file or stdout
+  # --- AÑADIR ESTAS LÍNEAS ---
+  # Ruta donde el script guardará los conteos. Debe ser escribible por wazuh.
+  rule_tracking_file: /var/ossec/integrations/rule_counts.csv
+  # Tiempo en segundos para reiniciar el contador de una regla (3600s = 1 hora)
+  rule_reset_interval: 3600
