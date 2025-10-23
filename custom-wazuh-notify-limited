@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import smtplib
+import yaml
+import logging
+import csv
+import os
+import fcntl
+import time
+from mako.template import Template
+from mako.lookup import TemplateLookup
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from utils.utils import get
+
+
+def render_string_template(template_string, data):
+    template = Template(template_string)
+    return template.render(data=data)
+
+def render_template(template_name, data):
+    lookup = TemplateLookup(directories=['./integrations/'])
+    template = lookup.get_template(template_name)
+    return template.render(data=data)
+
+def configure_logger(log_level, log_output, log_file_path):
+    logger = logging.getLogger(__name__)
+    logger.setLevel(getattr(logging, log_level.upper()))
+
+    formatter = logging.Formatter('%(asctime)s %(filename)s: %(levelname)s: %(name)s: %(message)s', "%Y/%m/%d %H:%M:%S")
+
+    if log_output.lower() == 'file':
+        file_handler = logging.FileHandler(log_file_path)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    elif log_output.lower() == 'stdout':
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    else:
+        raise ValueError("Invalid log output mode. Use 'file' or 'stdout'")
+
+    return logger
+
+def load_config(config_path):
+    with open(config_path, 'r') as yaml_file:
+        return yaml.safe_load(yaml_file)
+
+def send_email(smtp_server, smtp_port, smtp_username, smtp_password, from_email, destination_emails, msg):
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.sendmail(from_email, destination_emails, msg.as_string())
+            server.quit()
+        logger.info("Email sent successfully!")
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+
+def alert_email(config, event, from_email, destination_emails, subject_email, template_name):
+    body = render_template(template_name, event)
+    logger.info(f"Rendered email body: {body}")
+    destination_email_list = destination_emails.split(",")
+
+    smtp_server = get(config, 'smtp_server')
+    smtp_port = get(config, 'smtp_port')
+    smtp_username = get(config, 'smtp_username')
+    smtp_password = get(config, 'smtp_password')
+
+    if from_email is None:
+        from_email = config['default_from']
+
+    msg = MIMEMultipart()
+    msg['From'] = from_email
+    msg['To'] = ",".join(destination_email_list)
+    msg['Subject'] = subject_email
+    msg.attach(MIMEText(body, 'plain'))
+
+    send_email(smtp_server, smtp_port, smtp_username, smtp_password, from_email, destination_email_list, msg)
+
+def send_limit_warning_email(config, event, integration_params, rule_id, limit):
+    """
+    Envía un correo de advertencia notificando que se ha alcanzado el límite
+    para un rule_id específico.
+    """
+    logger.debug(f"Preparando correo de advertencia de límite para Rule ID: {rule_id}")
+    
+    # Reutilizar la configuración del perfil y destinos del JSON de integración
+    destination_emails = get(integration_params, 'alert_config.destination_emails')
+    profile_name = get(integration_params, 'alert_config.profile')
+    profile_config = config['profiles']['email'][profile_name]
+    
+    from_email = get(integration_params, 'alert_config.email_from', None)
+    if from_email is None:
+        # Usar el default del perfil si no se proveyó en la integración
+        from_email = profile_config.get('default_from', 'wazuh@localhost') 
+
+    # --- Crear Subject y Body personalizados para la advertencia ---
+    
+    subject = f"[WAZUH-LÍMITE ALCANZADO] Alertas suprimidas para Regla: {rule_id}"
+    
+    body = (
+        f"Este es un aviso automático.\n\n"
+        f"Se ha alcanzado el límite de envío de correos ({limit}) para la regla de Wazuh:\n\n"
+        f" - Rule ID: {rule_id}\n"
+        f" - Descripción: {get(event, 'rule.description', 'N/A')}\n"
+        f" - Agente: {get(event, 'agent.name', 'N/A')} (ID: {get(event, 'agent.id', 'N/A')})\n\n"
+        f"A partir de este momento, no se enviarán más notificaciones por correo para esta regla "
+        f"hasta que la ventana de tiempo se reinicie (según 'rule_reset_interval' en config.yaml).\n\n"
+        f"--- Última alerta que disparó el límite (JSON) ---\n"
+        f"{json.dumps(event, indent=4)}"
+    )
+    
+    destination_email_list = destination_emails.split(",")
+    
+    # Obtener configuración SMTP del perfil
+    smtp_server = get(profile_config, 'smtp_server')
+    smtp_port = get(profile_config, 'smtp_port')
+    smtp_username = get(profile_config, 'smtp_username')
+    smtp_password = get(profile_config, 'smtp_password')
+
+    msg = MIMEMultipart()
+    msg['From'] = from_email
+    msg['To'] = ",".join(destination_email_list)
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    # Usar la función send_email existente
+    logger.info(f"Enviando correo de ADVERTENCIA por límite a: {destination_emails}")
+    send_email(smtp_server, smtp_port, smtp_username, smtp_password, from_email, destination_email_list, msg)
+
+def read_counts(file_object):
+    """Lee el archivo CSV y devuelve un dict {rule_id: {'count': X, 'timestamp': Y}}."""
+    counts_data = {}
+    try:
+        file_object.seek(0)
+        reader = csv.reader(file_object)
+        for row in reader:
+            if len(row) == 3:  # Formato nuevo: rule_id, count, timestamp
+                try:
+                    counts_data[row[0]] = {'count': int(row[1]), 'timestamp': float(row[2])}
+                except (ValueError, IndexError):
+                    logger.warning(f"Dato inválido en archivo de conteo, ignorando fila: {row}")
+            elif len(row) == 2:  # Formato antiguo: rule_id, count (para migración)
+                try:
+                    # Asigna el timestamp actual para iniciar la ventana
+                    counts_data[row[0]] = {'count': int(row[1]), 'timestamp': time.time()}
+                except ValueError:
+                    logger.warning(f"Dato inválido (formato antiguo) en archivo de conteo, ignorando fila: {row}")
+    except Exception as e:
+        logger.warning(f"No se pudo parsear el archivo de conteo. Se asumen contadores en 0. Error: {e}")
+        return {}
+    return counts_data
+
+def write_counts(file_object, counts_data):
+    """Escribe el dict de conteos (formato de 3 columnas) en el objeto de archivo CSV."""
+    try:
+        file_object.seek(0)
+        file_object.truncate()
+        writer = csv.writer(file_object)
+        for rule_id, data in counts_data.items():
+            writer.writerow([rule_id, data['count'], data['timestamp']])
+    except Exception as e:
+        logger.error(f"Error al escribir en el archivo de conteo: {e}")
+
+def process_alert(config, wazuh_event_file_path, wazuh_integration_params):
+    alert_type = get(wazuh_integration_params, 'alert_type')
+    if not alert_type:
+        logger.error(f"Missing 'alert_type' in params: {wazuh_integration_params}")
+        sys.exit(1)
+
+    with open(wazuh_event_file_path, "r") as json_file:
+        wazuh_event = json.load(json_file)
+
+    # --- INICIO DE LÓGICA DE LÍMITE Y CONTEO ---
+    
+    rule_id = get(wazuh_event, 'rule.id')
+    if not rule_id:
+        logger.error("No se pudo encontrar 'rule.id' en el evento de Wazuh. Saltando.")
+        return # Salir si no hay rule_id
+
+    # Obtener ruta del archivo de seguimiento
+    tracking_file = get(config, 'global_config.rule_tracking_file')
+    if not tracking_file:
+        logger.error("No se ha definido 'rule_tracking_file' en global_config (config.yaml). El correo no se enviará.")
+        return
+        
+    # Obtener el intervalo de reset (en segundos) de la config, default 1h (3600s)
+    try:
+        reset_interval_seconds = int(get(config, 'global_config.rule_reset_interval', 3600))
+    except ValueError:
+        reset_interval_seconds = 3600
+        logger.warning("Valor 'rule_reset_interval' inválido en config.yaml, usando 3600s.")
+
+    # Obtener el límite desde los parámetros de la integración (default: 10)
+    try:
+        email_limit = int(get(wazuh_integration_params, 'alert_config.email_limit', 10))
+    except ValueError:
+        logger.warning(f"Valor 'email_limit' inválido. Usando default: 10.")
+        email_limit = 10
+
+    # --- EXTRAER PARÁMETROS DE EMAIL ---
+    profile_config = None
+    from_email = None
+    subject_email = None
+    template_name = None
+    destination_emails = None
+    profile_name = None
+
+    if alert_type == 'email':
+        from_email = get(wazuh_integration_params, 'alert_config.email_from', None)
+        subject_email = get(wazuh_integration_params, 'alert_config.email_subject', None)
+        template_name = get(wazuh_integration_params, 'alert_config.email_template', None)
+        destination_emails = get(wazuh_integration_params, 'alert_config.destination_emails', None)
+        profile_name = get(wazuh_integration_params, 'alert_config.profile', None)
+        
+        if not all([subject_email, template_name, destination_emails, profile_name]):
+            logger.error(f"Faltan parámetros de configuración de email (subject, template, destination o profile).")
+            sys.exit(1)
+        
+        profile_config = config['profiles']['email'][profile_name]
+    else:
+        logger.debug(f"Tipo de alerta no es 'email' ({alert_type}). Saltando.")
+        return
+
+    action_to_take = None # Opciones: 'send_normal', 'send_warning', 'do_nothing'
+
+    # --- Manejo de archivo con bloqueo (flock) ---
+    try:
+        with open(tracking_file, 'a+') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            
+            # Leer contadores y timestamps actuales
+            all_rule_data = read_counts(f)
+            current_time = time.time()
+            
+            # Obtener datos de nuestra regla (o valores default si es nueva)
+            rule_data = all_rule_data.get(rule_id, {'count': 0, 'timestamp': 0})
+            current_count = rule_data['count']
+            window_start_timestamp = rule_data['timestamp']
+
+            # --- LÓGICA DE VENTANA DE TIEMPO POR REGLA ---
+            if (current_time - window_start_timestamp) > reset_interval_seconds:
+                # La ventana de tiempo expiró. Reiniciar el conteo para ESTA REGLA.
+                logger.info(f"Ventana de tiempo para Rule ID {rule_id} expiró. Reiniciando contador.")
+                current_count = 1
+                window_start_timestamp = current_time # Reiniciar la ventana a "ahora"
+                action_to_take = 'send_normal'
+            
+            else:
+                # Sigue dentro de la ventana de tiempo. Comprobar límites.
+                if current_count < email_limit:
+                    current_count += 1
+                    action_to_take = 'send_normal'
+                    logger.info(f"Contador para Rule ID {rule_id} es {current_count}/{email_limit} (dentro de ventana). Enviando correo.")
+                
+                elif current_count == email_limit:
+                    current_count += 1
+                    action_to_take = 'send_warning'
+                    logger.warning(f"Límite alcanzado para Rule ID {rule_id} ({email_limit}). Enviando ADVERTENCIA de límite.")
+                
+                else: # current_count > email_limit
+                    action_to_take = 'do_nothing'
+                    logger.warning(f"Límite {rule_id} ({current_count}/{email_limit}) ya superado (dentro de ventana). Correo NO enviado.")
+            
+            # Actualizar los datos de nuestra regla en el dict general
+            all_rule_data[rule_id] = {'count': current_count, 'timestamp': window_start_timestamp}
+            
+            # Escribir TODOS los datos de vuelta al archivo
+            write_counts(f, all_rule_data)
+            
+            # Liberar bloqueo
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+    except Exception as e:
+        logger.error(f"Fallo al procesar el archivo de conteo {tracking_file}: {e}. El correo NO se enviará para evitar spam.")
+        return
+        
+    # --- FIN DE LÓGICA DE CONTEO (Bloqueo liberado) ---
+    
+    # --- EJECUTAR ACCIÓN DECIDIDA ---
+    
+    if action_to_take == 'send_normal':
+        subject_template = f"<%from utils.utils import get%>{subject_email}"
+        rendered_subject = render_string_template(subject_template, wazuh_event)
+        logger.info(f"Rendered email subject: {rendered_subject}")
+        alert_email(profile_config, wazuh_event, from_email, destination_emails, rendered_subject, template_name)
+    
+    elif action_to_take == 'send_warning':
+        send_limit_warning_email(config, wazuh_event, wazuh_integration_params, rule_id, email_limit)
+    
+    elif action_to_take == 'do_nothing':
+        pass
+
+
+def main():
+    if len(sys.argv) < 3:
+        logger.error("Missing required parameters")
+        sys.exit(1)
+
+    wazuh_event_file_path = sys.argv[1]
+    wazuh_arguments = ' '.join(sys.argv[2:])
+    if '10 3 > ' in wazuh_arguments:
+        wazuh_arguments = wazuh_arguments.split('10 3 > /dev/null')[0].strip()
+    else:
+        wazuh_arguments = wazuh_arguments.split('> /dev/null')[0].strip()
+    #wazuh_arguments = wazuh_arguments.split('> /dev/null')[0].strip()
+    wazuh_integration_params = json.loads(wazuh_arguments)
+
+    process_alert(config, wazuh_event_file_path, wazuh_integration_params)
+
+
+if __name__ == "__main__":
+    config = load_config('./integrations/config.yaml')
+    logger = configure_logger(config['global_config']['log_level'],
+                                config['global_config']['log_output'],
+                                config['global_config']['log_path'])
+    main()
