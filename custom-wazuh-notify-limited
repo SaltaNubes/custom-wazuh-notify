@@ -86,21 +86,50 @@ def send_limit_warning_email(config, event, integration_params, rule_id, limit):
     para un rule_id específico.
     """
     logger.debug(f"Preparando correo de advertencia de límite para Rule ID: {rule_id}")
-    
+
     # Reutilizar la configuración del perfil y destinos del JSON de integración
     destination_emails = get(integration_params, 'alert_config.destination_emails')
     profile_name = get(integration_params, 'alert_config.profile')
     profile_config = config['profiles']['email'][profile_name]
-    
+
     from_email = get(integration_params, 'alert_config.email_from', None)
     if from_email is None:
         # Usar el default del perfil si no se proveyó en la integración
-        from_email = profile_config.get('default_from', 'wazuh@localhost') 
+        from_email = profile_config.get('default_from', 'wazuh@localhost')
+
+    # --- INICIO: Renderizar el cuerpo de la alerta usando Mako ---
+    template_name = get(integration_params, 'alert_config.email_template', None)
+    last_alert_section = "" # Inicializar
+
+    if template_name:
+        try:
+            # Renderizar el cuerpo usando la misma plantilla que la alerta normal
+            formatted_body = render_template(template_name, event)
+            last_alert_section = (
+                f"--- Última alerta que disparó el límite (Formateada) ---\n\n"
+                f"{formatted_body}"
+            )
+        except Exception as e:
+            logger.error(f"No se pudo renderizar la plantilla Mako '{template_name}' para el correo de advertencia: {e}")
+            last_alert_section = (
+                f"--- Última alerta que disparó el límite (JSON) ---\n"
+                f"(Fallo al renderizar la plantilla: {template_name})\n\n"
+                f"{json.dumps(event, indent=4)}"
+            )
+    else:
+        # Fallback si no se encuentra el nombre de la plantilla
+        last_alert_section = (
+            f"--- Última alerta que disparó el límite (JSON) ---\n"
+            f"(Nombre de plantilla no encontrado en la configuración)\n\n"
+            f"{json.dumps(event, indent=4)}"
+        )
+    # --- FIN: Renderizar el cuerpo de la alerta ---
+
 
     # --- Crear Subject y Body personalizados para la advertencia ---
-    
+
     subject = f"[WAZUH-LÍMITE ALCANZADO] Alertas suprimidas para Regla: {rule_id}"
-    
+
     body = (
         f"Este es un aviso automático.\n\n"
         f"Se ha alcanzado el límite de envío de correos ({limit}) para la regla de Wazuh:\n\n"
@@ -109,12 +138,11 @@ def send_limit_warning_email(config, event, integration_params, rule_id, limit):
         f" - Agente: {get(event, 'agent.name', 'N/A')} (ID: {get(event, 'agent.id', 'N/A')})\n\n"
         f"A partir de este momento, no se enviarán más notificaciones por correo para esta regla "
         f"hasta que la ventana de tiempo se reinicie (según 'rule_reset_interval' en config.yaml).\n\n"
-        f"--- Última alerta que disparó el límite (JSON) ---\n"
-        f"{json.dumps(event, indent=4)}"
+        f"{last_alert_section}" #USAMOS LA SECCIÓN RENDERIZADA
     )
-    
+
     destination_email_list = destination_emails.split(",")
-    
+
     # Obtener configuración SMTP del perfil
     smtp_server = get(profile_config, 'smtp_server')
     smtp_port = get(profile_config, 'smtp_port')
@@ -175,7 +203,7 @@ def process_alert(config, wazuh_event_file_path, wazuh_integration_params):
         wazuh_event = json.load(json_file)
 
     # --- INICIO DE LÓGICA DE LÍMITE Y CONTEO ---
-    
+
     rule_id = get(wazuh_event, 'rule.id')
     if not rule_id:
         logger.error("No se pudo encontrar 'rule.id' en el evento de Wazuh. Saltando.")
@@ -186,7 +214,7 @@ def process_alert(config, wazuh_event_file_path, wazuh_integration_params):
     if not tracking_file:
         logger.error("No se ha definido 'rule_tracking_file' en global_config (config.yaml). El correo no se enviará.")
         return
-        
+
     # Obtener el intervalo de reset (en segundos) de la config, default 1h (3600s)
     try:
         reset_interval_seconds = int(get(config, 'global_config.rule_reset_interval', 3600))
@@ -215,11 +243,11 @@ def process_alert(config, wazuh_event_file_path, wazuh_integration_params):
         template_name = get(wazuh_integration_params, 'alert_config.email_template', None)
         destination_emails = get(wazuh_integration_params, 'alert_config.destination_emails', None)
         profile_name = get(wazuh_integration_params, 'alert_config.profile', None)
-        
+
         if not all([subject_email, template_name, destination_emails, profile_name]):
             logger.error(f"Faltan parámetros de configuración de email (subject, template, destination o profile).")
             sys.exit(1)
-        
+
         profile_config = config['profiles']['email'][profile_name]
     else:
         logger.debug(f"Tipo de alerta no es 'email' ({alert_type}). Saltando.")
@@ -231,11 +259,11 @@ def process_alert(config, wazuh_event_file_path, wazuh_integration_params):
     try:
         with open(tracking_file, 'a+') as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            
+
             # Leer contadores y timestamps actuales
             all_rule_data = read_counts(f)
             current_time = time.time()
-            
+
             # Obtener datos de nuestra regla (o valores default si es nueva)
             rule_data = all_rule_data.get(rule_id, {'count': 0, 'timestamp': 0})
             current_count = rule_data['count']
@@ -248,49 +276,49 @@ def process_alert(config, wazuh_event_file_path, wazuh_integration_params):
                 current_count = 1
                 window_start_timestamp = current_time # Reiniciar la ventana a "ahora"
                 action_to_take = 'send_normal'
-            
+
             else:
                 # Sigue dentro de la ventana de tiempo. Comprobar límites.
                 if current_count < email_limit:
                     current_count += 1
                     action_to_take = 'send_normal'
                     logger.info(f"Contador para Rule ID {rule_id} es {current_count}/{email_limit} (dentro de ventana). Enviando correo.")
-                
+
                 elif current_count == email_limit:
                     current_count += 1
                     action_to_take = 'send_warning'
                     logger.warning(f"Límite alcanzado para Rule ID {rule_id} ({email_limit}). Enviando ADVERTENCIA de límite.")
-                
+
                 else: # current_count > email_limit
                     action_to_take = 'do_nothing'
                     logger.warning(f"Límite {rule_id} ({current_count}/{email_limit}) ya superado (dentro de ventana). Correo NO enviado.")
-            
+
             # Actualizar los datos de nuestra regla en el dict general
             all_rule_data[rule_id] = {'count': current_count, 'timestamp': window_start_timestamp}
-            
+
             # Escribir TODOS los datos de vuelta al archivo
             write_counts(f, all_rule_data)
-            
+
             # Liberar bloqueo
             fcntl.flock(f, fcntl.LOCK_UN)
 
     except Exception as e:
         logger.error(f"Fallo al procesar el archivo de conteo {tracking_file}: {e}. El correo NO se enviará para evitar spam.")
         return
-        
+
     # --- FIN DE LÓGICA DE CONTEO (Bloqueo liberado) ---
-    
+
     # --- EJECUTAR ACCIÓN DECIDIDA ---
-    
+
     if action_to_take == 'send_normal':
         subject_template = f"<%from utils.utils import get%>{subject_email}"
         rendered_subject = render_string_template(subject_template, wazuh_event)
         logger.info(f"Rendered email subject: {rendered_subject}")
         alert_email(profile_config, wazuh_event, from_email, destination_emails, rendered_subject, template_name)
-    
+
     elif action_to_take == 'send_warning':
         send_limit_warning_email(config, wazuh_event, wazuh_integration_params, rule_id, email_limit)
-    
+
     elif action_to_take == 'do_nothing':
         pass
 
